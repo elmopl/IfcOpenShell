@@ -27,67 +27,81 @@
 
 bl_info = {
     "name": "IfcBlender",
-    "description": "Import files in the "
+    "description": "Import files in the "\
         "Industry Foundation Classes (.ifc) file format",
     "author": "Thomas Krijnen, IfcOpenShell",
     "blender": (2, 80, 0),
     "location": "File > Import",
-    "tracker_url": "https://sourceforge.net/p/ifcopenshell/"
+    "tracker_url": "https://sourceforge.net/p/ifcopenshell/"\
         "_list/tickets?source=navbar",
     "category": "Import-Export"}
 
 if "bpy" in locals():
-    import importlib
+    import imp
     if "ifcopenshell" in locals():
-        importlib.reload(ifcopenshell)
+        imp.reload(ifcopenshell)
 
-import bpy
-import mathutils
 from bpy.props import StringProperty, IntProperty, BoolProperty
 from bpy_extras.io_utils import ImportHelper
+from collections import defaultdict
+import bpy
+import logging
+import mathutils
+import os
 
-major, minor = bpy.app.version[0:2]
+major,minor = bpy.app.version[0:2]
 transpose_matrices = minor >= 62
 
-bpy.types.Object.ifc_id = IntProperty(
-    name="IFC Entity ID",
+bpy.types.Object.ifc_id = IntProperty(name="IFC Entity ID",
     description="The STEP entity instance name")
-bpy.types.Object.ifc_guid = StringProperty(
-    name="IFC Entity GUID",
+bpy.types.Object.ifc_guid = StringProperty(name="IFC Entity GUID",
     description="The IFC Globally Unique Identifier")
-bpy.types.Object.ifc_name = StringProperty(
-    name="IFC Entity Name",
+bpy.types.Object.ifc_name = StringProperty(name="IFC Entity Name",
     description="The optional name attribute")
-bpy.types.Object.ifc_type = StringProperty(
-    name="IFC Entity Type",
+bpy.types.Object.ifc_type = StringProperty(name="IFC Entity Type",
     description="The STEP Datatype keyword")
 
 
 def import_ifc(filename, use_names, process_relations, blender_booleans):
     from . import ifcopenshell
     from .ifcopenshell import geom as ifcopenshell_geom
-    print(f"Reading {bpy.path.basename(filename)}...")
+    from .ifcopenshell.file import file as ifcopenshell_file
+    print("Reading %s..."%bpy.path.basename(filename))
     settings = ifcopenshell_geom.settings()
     settings.set(settings.DISABLE_OPENING_SUBTRACTIONS, blender_booleans)
-    iterator = ifcopenshell_geom.iterator(settings, filename)
+    ifcfile = ifcopenshell.open(filename)
+    iterator = ifcopenshell_geom.iterator(settings, ifcfile)
     valid_file = iterator.initialize()
     if not valid_file:
         return False
     print("Done reading file")
-    id_to_object = {}
+    id_to_object = defaultdict(list) 
     id_to_parent = {}
+    id_to_name = {}
     id_to_matrix = {}
     openings = []
     old_progress = -1
     print("Creating geometry...")
-    collection = bpy.data.collections.new(f"{bpy.path.basename(filename)}")
-    bpy.context.scene.collection.children.link(collection)
-    if  process_relations:
-        rel_collection = bpy.data.collections.new("Relations")
-        collection.children.link(rel_collection)
+
+    root_collection = bpy.data.collections.new(os.path.basename(filename))
+    bpy.context.scene.collection.children.link(root_collection)
+
+    guid_collections = {}
+    collections = {
+        0: root_collection,
+    }
+
+    def get_collection(cid):
+        collection = collections.get(cid)
+        if collection is None:
+            collection = bpy.data.collections.new(str(cid))
+            collections[cid] = collection
+            root_collection.children.link(collection)
+        return collection
+
     while True:
         ob = iterator.get()
-
+ 
         f = ob.geometry.faces
         v = ob.geometry.verts
         mats = ob.geometry.materials
@@ -95,77 +109,74 @@ def import_ifc(filename, use_names, process_relations, blender_booleans):
         m = ob.transformation.matrix.data
         t = ob.type[0:21]
         nm = ob.name if len(ob.name) and use_names else ob.guid
-        # MESH CREATION
-        # Depending on version, geometry.id will be either int or str
-        mesh_name = 'mesh-%r' % ob.geometry.id
-        if mesh_name in bpy.data.meshes:
-            me = bpy.data.meshes[mesh_name]
-        else:
-            verts = [[v[i], v[i + 1], v[i + 2]]
-                     for i in range(0, len(v), 3)]
-            faces = [[f[i], f[i + 1], f[i + 2]]
-                     for i in range(0, len(f), 3)]
+        id_to_name[ob.id] = os.path.commonprefix((id_to_name.get(ob.id, nm), nm))
 
-            me = bpy.data.meshes.new(mesh_name)
-            me.from_pydata(verts, [], faces)
-            me.validate()
-            # MATERIAL CREATION
-            def add_material(mname, props):
-                if mname in bpy.data.materials:
-                    mat = bpy.data.materials[mname]
-                    mat.use_fake_user = True
-                else:
-                    mat = bpy.data.materials.new(mname)
-                    for k, v in props.items():
-                        if k == 'transparency':
-                            mat.blend_method = 'HASHED'
-                            mat.use_screen_refraction = True
-                            mat.refraction_depth = 0.1
-                            mat.use_nodes = True
-                            mat.node_tree.nodes["Principled BSDF"].inputs[15].default_value = v
+        verts = [[v[i], v[i + 1], v[i + 2]] \
+            for i in range(0, len(v), 3)]
+        faces = [[f[i], f[i + 1], f[i + 2]] \
+            for i in range(0, len(f), 3)]
+
+        me = bpy.data.meshes.new('mesh{}'.format(ob.geometry.id))
+        me.from_pydata(verts, [], faces)
+        me.validate()
+        
+        def add_material(mname, props):
+            if mname in bpy.data.materials:
+                mat = bpy.data.materials[mname]
+                mat.use_fake_user = True
+            else:
+                mat = bpy.data.materials.new(mname)
+                for k,v in props.items():
+                    if k == 'specular_hardness':
+                        # FIXME: This seems to not be available in Blender 2.80
+                        continue
+                    try:
+                        if hasattr(v, '__len__'):
+                            getattr(mat, k)[:len(v)] = v
                         else:
                             setattr(mat, k, v)
-                me.materials.append(mat)
+                    except Exception as exc:
+                        logging.exception(
+                            'Failed setting %s with property %s = %s: %s',
+                            mat,
+                            k,
+                            v,
+                            exc
+                        )
 
-            needs_default = -1 in matids
-            if needs_default:
-                add_material(t, {})
+            me.materials.append(mat)
+                
+        needs_default = -1 in matids
+        if needs_default: add_material(t, {})
+        
+        for mat in mats:
+            props = {}
+            if mat.has_diffuse: props['diffuse_color'] = mat.diffuse
+            if mat.has_specular: props['specular_color'] = mat.specular
+            if mat.has_transparency and mat.transparency > 0:
+                props['alpha'] = 1.0 - mat.transparency
+                props['use_transparency'] = True
+            if mat.has_specularity: props['specular_hardness'] = mat.specularity
+            add_material(mat.name, props)
 
-            for mat in mats:
-                props = {}
-                if mat.has_diffuse:
-                    alpha = 1.
-                    if mat.has_transparency and mat.transparency > 0:
-                        alpha = 1. - mat.transparency
-                    props['diffuse_color'] = mat.diffuse + (alpha,)
-                # @todo
-                # if mat.has_specular:
-                #     props['specular_color'] = mat.specular
-                # if mat.has_specularity:
-                #     props['specular_intensity'] = mat.specularity
-                add_material(mat.name, props)
-
-            faces = me.polygons if hasattr(me, 'polygons') else me.faces
-            if len(faces) == len(matids):
-                for face, matid in zip(faces, matids):
-                    face.material_index = matid + (1 if needs_default else 0)
-
-        # OBJECT CREATION
         bob = bpy.data.objects.new(nm, me)
-        mat = mathutils.Matrix(([m[0], m[1], m[2], 0],
-                                [m[3], m[4], m[5], 0],
-                                [m[6], m[7], m[8], 0],
-                                [m[9], m[10], m[11], 1]))
-        if transpose_matrices:
-            mat.transpose()
+        mat = mathutils.Matrix((
+            [m[0], m[1], m[2], 0],
+            [m[3], m[4], m[5], 0],
+            [m[6], m[7], m[8], 0],
+            [m[9], m[10], m[11], 1]
+        ))
 
+        if transpose_matrices: mat.transpose()
+        
         if process_relations:
             id_to_matrix[ob.id] = mat
         else:
             bob.matrix_world = mat
-        collection.objects.link(bob)
 
+        get_collection(ob.parent_id).objects.link(bob)
         bpy.context.view_layer.objects.active = bob
+
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.normals_make_consistent()
         bpy.ops.object.mode_set(mode='OBJECT')
@@ -175,19 +186,22 @@ def import_ifc(filename, use_names, process_relations, blender_booleans):
 
         if ob.type == 'IfcSpace' or ob.type == 'IfcOpeningElement':
             if not (ob.type == 'IfcOpeningElement' and blender_booleans):
-                bob.hide_viewport = bob.hide_render = True
+                bob.hide_set(True)
             bob.display_type = 'WIRE'
-
-        if ob.id not in id_to_object:
-            id_to_object[ob.id] = []
+        
         id_to_object[ob.id].append(bob)
 
         if ob.parent_id > 0:
             id_to_parent[ob.id] = ob.parent_id
-
+            
         if blender_booleans and ob.type == 'IfcOpeningElement':
             openings.append(ob.id)
-
+            
+        faces = me.polygons if hasattr(me, 'polygons') else me.faces
+        if len(faces) == len(matids):
+            for face, matid in zip(faces, matids):
+                face.material_index = matid + (1 if needs_default else 0)
+            
         progress = iterator.progress() // 2
         if progress > old_progress:
             print("\r[" + "#" * progress + " " * (50 - progress) + "]", end="")
@@ -198,13 +212,35 @@ def import_ifc(filename, use_names, process_relations, blender_booleans):
     print("\rDone creating geometry" + " " * 30)
 
     id_to_parent_temp = dict(id_to_parent)
-
+    
     if process_relations:
         print("Processing relations...")
 
+    for cid, collection in collections.items():
+        if cid == 0:
+            continue
+
+        name = id_to_name.get(cid)
+        if name is None:
+            ifc_obj = None
+            try:
+                ifc_obj = ifcfile.by_id(cid)
+            except Exception:
+                logging.exception("Failed to resolve id %s to object", cid) 
+            try:
+                name = ifc_obj.Name
+            except Exception:
+                name = 'unresolved_{}'.format(cid)
+                logging.exception("Failed to retrieve name from %s", ifc_obj) 
+        collection.name = name
+        parent_cid = id_to_parent.get(cid)
+        parent_collection = collections.get(parent_cid, root_collection)
+        root_collection.children.unlink(collection)
+        parent_collection.children.link(collection)
+
     while len(id_to_parent_temp) and process_relations:
         id, parent_id = id_to_parent_temp.popitem()
-
+        
         if parent_id in id_to_object:
             bob = id_to_object[parent_id][0]
         else:
@@ -216,17 +252,18 @@ def import_ifc(filename, use_names, process_relations, blender_booleans):
                 nm = parent_ob.name if len(parent_ob.name) and use_names \
                     else parent_ob.guid
                 bob = bpy.data.objects.new(nm, None)
-
+                
                 mat = mathutils.Matrix((
                     [m[0], m[1], m[2], 0],
                     [m[3], m[4], m[5], 0],
                     [m[6], m[7], m[8], 0],
-                    [m[9], m[10], m[11], 1]))
-                if transpose_matrices:
-                    mat.transpose()
-                id_to_matrix[parent_ob.id] = mat
+                    [m[9], m[10], m[11], 1],
+                ))
 
-                rel_collection.objects.link(bob)
+                if transpose_matrices: mat.transpose()
+                id_to_matrix[parent_ob.id] = mat
+                
+                bpy.context.scene.objects.link(bob)
 
                 bob.ifc_id = parent_ob.id
                 bob.ifc_name, bob.ifc_type, bob.ifc_guid = \
@@ -235,7 +272,6 @@ def import_ifc(filename, use_names, process_relations, blender_booleans):
                 if parent_ob.parent_id > 0:
                     id_to_parent[parent_id] = parent_ob.parent_id
                     id_to_parent_temp[parent_id] = parent_ob.parent_id
-                if parent_id not in id_to_object: id_to_object[parent_id] = []
                 id_to_object[parent_id].append(bob)
         if bob:
             for ob in id_to_object[id]:
@@ -249,13 +285,13 @@ def import_ifc(filename, use_names, process_relations, blender_booleans):
         parent_matrix = id_to_matrix.get(parent_id, None)
         for ob in id_to_object[id]:
             if parent_matrix:
-                ob.matrix_local = parent_matrix.inverted() @ matrix
+                ob.matrix_local = parent_matrix.inverted() * matrix
             else:
                 ob.matrix_world = matrix
-
+            
     if process_relations:
         print("Done processing relations")
-
+        
     for opening_id in openings:
         parent_id = id_to_parent[opening_id]
         if parent_id in id_to_object:
@@ -264,11 +300,10 @@ def import_ifc(filename, use_names, process_relations, blender_booleans):
                 mod = parent_ob.modifiers.new("opening", "BOOLEAN")
                 mod.operation = "DIFFERENCE"
                 mod.object = opening_ob
-
-    if hasattr(iterator, 'getLog'):
-        # @todo
-        txt = bpy.data.texts.new(f"{bpy.path.basename(filename)}.log")
-        txt.from_string(iterator.getLog())
+        
+    #txt = bpy.data.texts.new("%s.log"%bpy.path.basename(filename))
+    #txt.from_string(iterator.get_log())
+    print(dir(iterator))
 
     return True
 
@@ -278,52 +313,44 @@ class ImportIFC(bpy.types.Operator, ImportHelper):
     bl_label = "Import .ifc file"
 
     filename_ext = ".ifc"
-    filter_glob: StringProperty(default="*.ifc", options={'HIDDEN'})
+    filter_glob = StringProperty(default="*.ifc", options={'HIDDEN'})
 
-    use_names: BoolProperty(name="Use entity names",
-                            description="Use entity names rather than "
-                            "GlobalIds for objects",
-                            default=True)
-    process_relations: BoolProperty(name="Process relations",
-                                    description="Convert containment and "
-                                    "aggregation relations to parenting"
-                                    " (warning: may be slow on large files)",
-                                    default=False)
-    blender_booleans: BoolProperty(name="Use Blender booleans",
-                                   description="Use Blender boolean modifiers "
-                                   "for opening elements",
-                                   default=False)
+    use_names = BoolProperty(name="Use entity names",
+        description="Use entity names rather than GlobalIds for objects",
+        default=True)
+    process_relations = BoolProperty(name="Process relations",
+        description="Convert containment and aggregation" \
+            " relations to parenting" \
+            " (warning: may be slow on large files)",
+        default=False)
+    blender_booleans = BoolProperty(name="Use Blender booleans",
+        description="Use Blender boolean modifiers for opening" \
+            " elements",
+        default=False)
 
     def execute(self, context):
-        if not import_ifc(self.filepath, self.use_names,
-                          self.process_relations, self.blender_booleans):
+        if not import_ifc(self.filepath, self.use_names, self.process_relations, self.blender_booleans):
             self.report({'ERROR'},
-                        'Unable to parse .ifc file or no geometrical entities found'
-                        )
+                'Unable to parse .ifc file or no geometrical entities found'
+            )
         return {'FINISHED'}
 
 
 def menu_func_import(self, context):
     self.layout.operator(ImportIFC.bl_idname,
-                         text="Industry Foundation Classes (.ifc)")
+        text="Industry Foundation Classes (.ifc)")
 
-
-classes = (
+CLASSES = (
     ImportIFC,
 )
 
-
 def register():
-    for cls in classes:
+    for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
-
 
 def unregister():
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
-    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
-
+    for cls in reversed(CLASSES):
+        bpy.utils.register_class(cls)
 
 if __name__ == "__main__":
     register()
