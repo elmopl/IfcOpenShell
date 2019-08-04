@@ -19,6 +19,11 @@
 
 cmake_minimum_required (VERSION 2.8.5)
 
+# TODO: Once minimum version of CMake is increased above 3.13.0
+#       this can be removed (and check for version in ifcwrap/CMakeLists.txt
+#       can be removed).
+cmake_policy(SET CMP0078 OLD)
+
 project (IfcOpenShell)
 
 OPTION(UNICODE_SUPPORT "Build IfcOpenShell with Unicode support (requires ICU)." ON)
@@ -416,8 +421,6 @@ ElSE()
     add_definitions(-Wall -Wextra)
     if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         add_definitions(-Wno-tautological-constant-out-of-range-compare)
-    else()
-        add_definitions(-Wno-maybe-uninitialized)
     endif()
     # -fPIC is not relevant on Windows and creates pointless warnings
     if (UNIX)
@@ -425,8 +428,11 @@ ElSE()
     endif()
 ENDIF()
 
-INCLUDE_DIRECTORIES(${INCLUDE_DIRECTORIES} ${OCC_INCLUDE_DIR} ${OPENCOLLADA_INCLUDE_DIRS}
-	${ICU_INCLUDE_DIR} ${Boost_INCLUDE_DIRS}
+INCLUDE_DIRECTORIES(
+    ${INCLUDE_DIRECTORIES}
+    # Headers we depend on go as system dependencies.
+    # This stops gcc from printing warnings about code we do not own.
+    SYSTEM ${OCC_INCLUDE_DIR} ${OPENCOLLADA_INCLUDE_DIRS} ${ICU_INCLUDE_DIR} ${Boost_INCLUDE_DIRS}
 )
 
 function(files_for_ifc_version IFC_VERSION RESULT_NAME)

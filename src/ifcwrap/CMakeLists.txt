@@ -53,7 +53,17 @@ IF (WIN32 AND NOT PYTHON_DEBUG_LIBRARIES)
 ENDIF()
 
 SET_SOURCE_FILES_PROPERTIES(IfcPython.i PROPERTIES CPLUSPLUS ON)
-SWIG_ADD_MODULE(ifcopenshell_wrapper python IfcPython.i)
+
+if (${CMAKE_VERSION} VERSION_LESS "3.8.0")
+  SWIG_ADD_MODULE(ifcopenshell_wrapper python IfcPython.i)
+else()
+  SWIG_ADD_LIBRARY(
+    ifcopenshell_wrapper
+    LANGUAGE python
+    SOURCES IfcPython.i
+    TYPE MODULE)
+endif()
+
 if("$ENV{LDFLAGS}" MATCHES ".undefined.suppress")
 # On osx there is some state in the python dylib. With `-Wl,undefined,suppress` we can ignore the missing symbols at compile time.
 SWIG_LINK_LIBRARIES(ifcopenshell_wrapper ${IFCOPENSHELL_LIBRARIES} ${OPENCASCADE_LIBRARIES}
@@ -94,7 +104,7 @@ IF(PYTHONINTERP_FOUND AND NOT "${PYTHON_EXECUTABLE}" STREQUAL "")
                 "${CMAKE_CURRENT_SOURCE_DIR}/../ifcopenshell-python/ifcopenshell/geom/main.py"
                 "${CMAKE_CURRENT_SOURCE_DIR}/../ifcopenshell-python/ifcopenshell/geom/occ_utils.py"
                 DESTINATION "${python_package_dir}/ifcopenshell/geom")
-        INSTALL(TARGETS _ifcopenshell_wrapper DESTINATION "${python_package_dir}/ifcopenshell")
+        INSTALL(TARGETS "${SWIG_MODULE_ifcopenshell_wrapper_REAL_NAME}" DESTINATION "${python_package_dir}/ifcopenshell")
     ENDIF()
 ELSE()
     MESSAGE(WARNING "No Python interpreter found, unable to install the Python wrapper")
